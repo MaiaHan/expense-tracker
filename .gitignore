@@ -1,0 +1,20 @@
+# Secrets
+.env
+.env.*
+
+# Personal financial data (use synthetic sample data for demos)
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
