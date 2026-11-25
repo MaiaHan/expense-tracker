@@ -1,5 +1,4 @@
 import os
-import re
 import io
 import json
 import pandas as pd
@@ -11,8 +10,9 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 from database import (
     init_db, get_categories, engine, Transaction, Category, make_transaction_id,
-    CARD_PAYMENT, NON_SPENDING_CATEGORIES, rule_based_category,
+    NON_SPENDING_CATEGORIES,
 )
+from classifier import clean_description, predict_categories
 
 # Load API keys from .env file
 load_dotenv()
@@ -23,17 +23,6 @@ init_db()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 app = FastAPI()
-
-# Max number of merchant descriptions sent to the LLM in one request
-CLASSIFY_BATCH_SIZE = 100
-
-
-def clean_description(text):
-    text = re.sub(r'APPLE PAY ENDING IN \w+', '', str(text))
-    text = re.sub(r'\d{10,}', '', text)
-    text = re.sub(r'\d{3}-\d{3}-\d{4}', '', text)
-    return text.strip()
-
 
 def load_transactions_df(session: Session) -> pd.DataFrame:
     """All stored transactions as a DataFrame (empty DataFrame if none)."""
@@ -172,35 +161,6 @@ async def delete_category(name: str):
     return {"success": True, "message": f"Category '{name}' deleted"}
 
 
-def categorize_descriptions(descriptions: list[str], categories: list[str]) -> dict:
-    """Ask the LLM to categorize merchant descriptions, in batches to stay within token limits."""
-    result = {}
-    for start in range(0, len(descriptions), CLASSIFY_BATCH_SIZE):
-        batch = descriptions[start:start + CLASSIFY_BATCH_SIZE]
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": f"""You are an expense categorizer.
-You will receive a list of expense descriptions.
-Categorize each one into ONE of these categories: {', '.join(categories)}.
-Use "{CARD_PAYMENT}" only for payments toward the credit card bill itself.
-Refunds from a merchant are NOT card payments: give them the merchant's normal category.
-Return ONLY a JSON object where keys are the expense descriptions and values are the categories.
-Example: {{"STARBUCKS SEATTLE WA": "Food & Dining", "UBER TRIP": "Transportation"}}"""
-                },
-                {
-                    "role": "user",
-                    "content": f"Categorize these expenses: {json.dumps(batch)}"
-                }
-            ],
-            response_format={"type": "json_object"}
-        )
-        result.update(json.loads(response.choices[0].message.content))
-    return result
-
-
 # /classify endpoint
 @app.post("/classify")
 async def classify(reclassify: bool = False):
@@ -211,7 +171,6 @@ async def classify(reclassify: bool = False):
     Pass reclassify=true to redo everything (e.g. after changing categories).
     """
     categories = get_categories()
-    llm_categories = categories + [CARD_PAYMENT]
 
     with Session(engine) as session:
         if session.query(Transaction).count() == 0:
@@ -222,33 +181,12 @@ async def classify(reclassify: bool = False):
             query = query.filter(Transaction.predicted_category.is_(None))
         pending = query.all()
 
-        # 1) Clear-cut card payments / cashback are labeled by rule, no LLM needed
-        needs_llm = []
-        for t in pending:
-            rule_category = rule_based_category(t.description, t.amount)
-            if rule_category:
-                t.predicted_category = rule_category
-            else:
-                needs_llm.append(t)
-
-        # 2) Everything else goes to the LLM, unique descriptions only
-        unique_descriptions = sorted({t.description for t in needs_llm})
-        cleaned = {d: clean_description(d) for d in unique_descriptions}
-        print(f"Transactions to classify: {len(pending)} "
-              f"({len(pending) - len(needs_llm)} by rule), Unique merchants for LLM: {len(unique_descriptions)}")
-
-        if unique_descriptions:
-            result = categorize_descriptions(sorted(set(cleaned.values())), llm_categories)
-
-            # Map cleaned descriptions back to each transaction
-            for t in needs_llm:
-                category = result.get(cleaned[t.description], "Other")
-                if category not in llm_categories:
-                    category = "Other"
-                # A purchase (positive amount) can never be a card payment
-                if category == CARD_PAYMENT and t.amount >= 0:
-                    category = "Other"
+        if pending:
+            result = predict_categories(client, [(t.description, t.amount, t.category) for t in pending], categories)
+            for t, category in zip(pending, result["categories"]):
                 t.predicted_category = category
+            print(f"Classified {len(pending)} transactions ({sum(result['by_rule'])} by rule), "
+                  f"{result['llm_merchants']} unique merchants in {result['llm_calls']} LLM calls")
 
         session.commit()
 
