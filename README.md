@@ -44,6 +44,37 @@ python evaluate.py data/labels.csv --bank-hint              # the issuer-categor
 
 The labels CSV needs `description, amount, true_category`. Optional columns are `date`, `bank_category` and `label_source`.
 
+## Performance
+
+`benchmarks/bench.py` load-tests the API in-process on synthetic statements (PostgreSQL 16 in Docker on an Apple M5 laptop). The LLM is simulated: each call sleeps like the real API did on the labeled data (0.5s + 0.11s per merchant), scaled by 0.1 so runs stay short.
+
+| PostgreSQL | before | after |
+|---|---|---|
+| Upload 100k rows | **crashed**: dedupe check sent all IDs in one `IN (...)` (Postgres max is 65,535 parameters) | 3.0s (33k rows/s) |
+| Upload 10k rows | 0.53s | 0.36s |
+| Classify 10k rows (495 merchants, 5 LLM calls) | 6.2s | 2.7s |
+| `/fraud` 10k rows | 10.6s, O(n²) | **0.17s** (62×) |
+| `/fraud` 100k rows | — | 1.3s |
+
+What changed:
+- **Upload.** `INSERT … ON CONFLICT DO NOTHING RETURNING id`, sent through SQLAlchemy's batched multi-row inserts. The database skips existing IDs itself, so there's no separate duplicate lookup.
+- **Classify.**
+  - LLM batches run 4 at a time. They're I/O-bound.
+  - Results are written back with one bulk UPDATE by primary key instead of loading ORM objects.
+- **Fraud rules.** Group-by transforms replace a per-row scan. The 7-day window count uses binary search over each merchant's sorted dates. A test checks the output is identical to the old implementation on random data.
+- **Endpoints are plain `def`, not `async def`.** They call the blocking OpenAI client and database driver, which inside `async def` would stall the event loop for every other request.
+- **Schema.**
+  - `amount` is `NUMERIC(12,2)` (exact sums) and `date` is `DATE`.
+  - Indexes on `date` and `predicted_category`.
+  - Existing databases are upgraded on startup.
+
+```bash
+docker compose up -d db
+docker compose exec db psql -U expense -d expense_tracker -c "CREATE DATABASE expense_bench"
+DATABASE_URL=postgresql://expense:expense@localhost:5432/expense_bench \
+  python benchmarks/bench.py --rows 100000 --merchants 2000 --fraud-max-rows 100000
+```
+
 ## Running it
 
 Create a `.env` with your keys (it is read at runtime and never copied into the image):
@@ -82,11 +113,12 @@ docker compose exec db psql -U expense -d expense_tracker -c "CREATE DATABASE ex
 TEST_DATABASE_URL=postgresql://expense:expense@localhost:5432/expense_test python -m pytest tests
 ```
 
-The 24 tests cover:
+The 27 tests cover:
 - the built-in rules and the categorization pipeline
-- upload dedupe
+- upload dedupe, including uploads spanning many insert batches
 - spending summaries
 - correction rules (specificity, deletion fallback, manual fixes surviving reclassify)
+- the vectorized fraud rules matching the original implementation
 - the startup schema upgrade for older databases
 - `evaluate.py`
 
@@ -111,4 +143,4 @@ The LLM is faked, so the tests make no network calls. They pass on both SQLite a
 - Use the issuer category only as a fallback when the model answers "Other", or turn it into candidate categories instead of a single label.
 - Run the eval on statements from other banks.
 - Coupon search: extract structured deals (merchant, code, discount, expiry) instead of raw search results.
-- Make `/fraud` vectorized; it is currently O(n²).
+- Stream large uploads instead of reading the whole CSV into memory; paginate `GET /transactions`.

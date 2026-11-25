@@ -1,7 +1,7 @@
 import os
 import re
 import hashlib
-from sqlalchemy import create_engine, inspect, text, Column, Integer, String, Float, DateTime
+from sqlalchemy import create_engine, inspect, text, Column, Date, DateTime, Index, Integer, Numeric, String
 from sqlalchemy.orm import DeclarativeBase, Session
 from datetime import datetime
 
@@ -20,18 +20,25 @@ class Transaction(Base):
     __tablename__ = "transactions"
 
     id = Column(String, primary_key=True)    # deterministic hash, see make_transaction_id
-    date = Column(String)                    # ISO format: YYYY-MM-DD
+    date = Column(Date)
     description = Column(String)
-    amount = Column(Float)
+    # Exact decimal in the database, so SUMs don't pick up float error; plain float in Python
+    amount = Column(Numeric(12, 2, asdecimal=False))
     category = Column(String)                # category provided by the bank CSV, if any
     predicted_category = Column(String)      # category assigned by us (see category_source)
     category_source = Column(String)         # "manual" | "user_rule" | "rule" | "llm"
     created_at = Column(DateTime, default=datetime.now)
 
+    __table_args__ = (
+        Index("ix_transactions_date", "date"),
+        # /classify looks up rows with no category yet; /chat groups by category
+        Index("ix_transactions_predicted_category", "predicted_category"),
+    )
+
     def to_dict(self):
         return {
             "id": self.id,
-            "date": self.date,
+            "date": self.date.isoformat() if self.date else None,
             "description": self.description,
             "amount": self.amount,
             "category": self.category,
@@ -108,15 +115,36 @@ def make_transaction_id(date: str, description: str, amount: float, occurrence: 
     key = f"{date}|{description}|{amount:.2f}|{occurrence}"
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
 
+def upgrade_schema():
+    """Bring databases created by older versions up to the current schema.
+
+    create_all only creates missing tables, not missing columns, indexes or type changes.
+    (A project that keeps growing would use Alembic; these few steps are idempotent.)
+    """
+    inspector = inspect(engine)
+    columns = {c["name"]: c["type"] for c in inspector.get_columns("transactions")}
+    indexes = {i["name"] for i in inspector.get_indexes("transactions")}
+    with engine.begin() as conn:
+        if "category_source" not in columns:
+            conn.execute(text("ALTER TABLE transactions ADD COLUMN category_source VARCHAR"))
+        # SQLite stores any type in any column and reads 'YYYY-MM-DD' strings as dates,
+        # so only Postgres needs the old float/varchar columns converted
+        if engine.dialect.name == "postgresql":
+            if not isinstance(columns["amount"], Numeric) or columns["amount"].scale != 2:
+                conn.execute(text("ALTER TABLE transactions ALTER COLUMN amount TYPE NUMERIC(12, 2) "
+                                  "USING round(amount::numeric, 2)"))
+            if not isinstance(columns["date"], Date):
+                conn.execute(text("ALTER TABLE transactions ALTER COLUMN date TYPE DATE USING date::date"))
+        for index in Transaction.__table__.indexes:
+            if index.name not in indexes:
+                index.create(conn)
+
+
 def init_db():
     # Create all tables
     Base.metadata.create_all(engine)
 
-    # create_all doesn't add new columns to an existing table, so add them by hand
-    columns = {c["name"] for c in inspect(engine).get_columns("transactions")}
-    if "category_source" not in columns:
-        with engine.begin() as conn:
-            conn.execute(text("ALTER TABLE transactions ADD COLUMN category_source VARCHAR"))
+    upgrade_schema()
 
     # Add default categories if none exist
     with Session(engine) as session:

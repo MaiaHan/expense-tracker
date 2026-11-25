@@ -7,11 +7,14 @@ from __future__ import annotations
 
 import re
 import json
+from concurrent.futures import ThreadPoolExecutor
 from database import CARD_PAYMENT, NON_SPENDING_CATEGORIES, rule_based_category
 
 MODEL = "gpt-4o-mini"
 # Max number of merchant descriptions sent to the LLM in one request
 CLASSIFY_BATCH_SIZE = 100
+# Batches sent to the LLM at the same time (each request mostly waits on the network)
+LLM_CONCURRENCY = 4
 
 
 def clean_description(text):
@@ -50,10 +53,15 @@ def categorize_descriptions(client, items: list[tuple[str, str | None]], categor
         'often labeled "Merchandise", transit and rideshare "Travel/ Entertainment") - use it as a '
         "hint, not the answer.\n"
     ) if use_bank_hint else ""
-    result = {}
-    stats = {"llm_calls": 0, "unanswered": 0}
-    for start in range(0, len(items), CLASSIFY_BATCH_SIZE):
-        batch = items[start:start + CLASSIFY_BATCH_SIZE]
+    system_prompt = f"""You are an expense categorizer.
+You will receive a list of credit card transactions, each with an id and a merchant description.
+Categorize each one into ONE of these categories: {', '.join(categories)}.
+Use "{CARD_PAYMENT}" only for payments toward the credit card bill itself.
+Refunds from a merchant are NOT card payments: give them the merchant's normal category.
+{hint_rule}Return ONLY a JSON object mapping each id (as a string) to its category.
+Example: {{"0": "Food & Dining", "1": "Transportation"}}"""
+
+    def ask(batch):
         payload = []
         for i, (description, bank_category) in enumerate(batch):
             entry = {"id": i, "description": description}
@@ -63,25 +71,20 @@ def categorize_descriptions(client, items: list[tuple[str, str | None]], categor
         response = client.chat.completions.create(
             model=MODEL,
             messages=[
-                {
-                    "role": "system",
-                    "content": f"""You are an expense categorizer.
-You will receive a list of credit card transactions, each with an id and a merchant description.
-Categorize each one into ONE of these categories: {', '.join(categories)}.
-Use "{CARD_PAYMENT}" only for payments toward the credit card bill itself.
-Refunds from a merchant are NOT card payments: give them the merchant's normal category.
-{hint_rule}Return ONLY a JSON object mapping each id (as a string) to its category.
-Example: {{"0": "Food & Dining", "1": "Transportation"}}"""
-                },
-                {
-                    "role": "user",
-                    "content": f"Categorize these transactions: {json.dumps(payload)}"
-                }
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Categorize these transactions: {json.dumps(payload)}"},
             ],
             response_format={"type": "json_object"}
         )
-        stats["llm_calls"] += 1
-        answers = json.loads(response.choices[0].message.content)
+        return json.loads(response.choices[0].message.content)
+
+    batches = [items[i:i + CLASSIFY_BATCH_SIZE] for i in range(0, len(items), CLASSIFY_BATCH_SIZE)]
+    with ThreadPoolExecutor(max_workers=LLM_CONCURRENCY) as pool:
+        all_answers = list(pool.map(ask, batches))
+
+    result = {}
+    stats = {"llm_calls": len(batches), "unanswered": 0}
+    for batch, answers in zip(batches, all_answers):
         for i, item in enumerate(batch):
             if str(i) in answers:
                 result[item] = answers[str(i)]

@@ -2,12 +2,14 @@ import os
 import io
 import json
 from typing import Optional
+import numpy as np
 import pandas as pd
 from openai import OpenAI
 from tavily import TavilyClient
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, update
+from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.orm import Session
 from database import (
     init_db, get_categories, engine, Transaction, Category, MerchantRule, make_transaction_id,
@@ -25,17 +27,45 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 app = FastAPI()
 
+def dialect_insert(table):
+    """INSERT that supports on_conflict_do_nothing for the database in use."""
+    if engine.dialect.name == "postgresql":
+        return postgresql.insert(table)
+    return sqlite.insert(table)
+
+TRANSACTION_FIELDS = ["id", "date", "description", "amount", "category", "predicted_category", "category_source"]
+
+
+def all_transactions(session: Session) -> list[dict]:
+    """Every stored transaction as a JSON-ready dict, oldest first.
+
+    Selects plain columns instead of loading ORM objects, which is several times faster
+    for large tables.
+    """
+    columns = [getattr(Transaction, f) for f in TRANSACTION_FIELDS]
+    rows = session.query(*columns).order_by(Transaction.date, Transaction.id).all()
+    return [
+        {**dict(zip(TRANSACTION_FIELDS, row)),
+         "date": row.date.isoformat() if row.date else None,
+         "amount": None if row.amount is None else float(row.amount)}  # SQLite may hand back ints
+        for row in rows
+    ]
+
+
 def load_transactions_df(session: Session) -> pd.DataFrame:
     """All stored transactions as a DataFrame (empty DataFrame if none)."""
-    rows = [t.to_dict() for t in session.query(Transaction).order_by(Transaction.date).all()]
-    return pd.DataFrame(rows, columns=["id", "date", "description", "amount", "category", "predicted_category"])
+    return pd.DataFrame(all_transactions(session), columns=TRANSACTION_FIELDS)
 
+
+# Endpoints are plain `def`, not `async def`: they do blocking work (DB, OpenAI client, pandas),
+# which inside async endpoints would stall the event loop for every other request.
+# FastAPI runs plain def endpoints in a thread pool instead.
 
 # /upload endpoint
 @app.post("/upload")
-async def upload(file: UploadFile = File(...)):
+def upload(file: UploadFile = File(...)):
     # Read the uploaded CSV file
-    contents = await file.read()
+    contents = file.file.read()
     df = pd.read_csv(io.BytesIO(contents))
 
     # Show AI the column names and first 3 rows to figure out the structure
@@ -99,33 +129,39 @@ Return ONLY a JSON object like this:
     })
     valid = normalized.dropna(subset=["date", "amount"])
     skipped = len(normalized) - len(valid)
-    valid = valid.assign(date=valid["date"].dt.strftime("%Y-%m-%d"))
+    valid = valid.assign(date=valid["date"].dt.date, amount=valid["amount"].round(2))
 
-    # Build deterministic IDs so re-uploads (or overlapping statements) don't duplicate rows
+    # Deterministic IDs so re-uploads (or overlapping statements) don't duplicate rows
     occurrence = valid.groupby(["date", "description", "amount"]).cumcount()
-    records = []
-    for (_, row), n in zip(valid.iterrows(), occurrence):
-        records.append(Transaction(
-            id=make_transaction_id(row["date"], row["description"], row["amount"], n),
-            date=row["date"],
-            description=row["description"],
-            amount=float(row["amount"]),
-            category=None if pd.isna(row["category"]) else str(row["category"]),
-        ))
+    records = [
+        {
+            "id": make_transaction_id(d.isoformat(), desc, float(amount), int(n)),
+            "date": d,
+            "description": desc,
+            "amount": float(amount),
+            "category": None if pd.isna(cat) else str(cat),
+        }
+        for d, desc, amount, cat, n in zip(valid["date"], valid["description"], valid["amount"],
+                                           valid["category"], occurrence)
+    ]
 
+    # INSERT ... ON CONFLICT DO NOTHING RETURNING id: the database skips IDs it already has and
+    # reports the ones it inserted. Passing a list of rows lets SQLAlchemy batch them into
+    # multi-row statements ("insertmanyvalues"), which also stays under bind-parameter limits.
     with Session(engine) as session:
-        ids = [r.id for r in records]
-        existing = {
-            tid for (tid,) in session.query(Transaction.id).filter(Transaction.id.in_(ids)).all()
-        } if ids else set()
-        new_records = [r for r in records if r.id not in existing]
-        session.add_all(new_records)
+        if records:
+            stmt = (dialect_insert(Transaction)
+                    .on_conflict_do_nothing(index_elements=["id"])
+                    .returning(Transaction.id))
+            inserted = len(session.execute(stmt, records).all())
+        else:
+            inserted = 0
         session.commit()
 
     return {
         "rows": len(records),
-        "inserted": len(new_records),
-        "duplicates": len(records) - len(new_records),
+        "inserted": inserted,
+        "duplicates": len(records) - inserted,
         "skipped_invalid": skipped,
         "columns": columns,
         "detected_mapping": col_map
@@ -133,13 +169,13 @@ Return ONLY a JSON object like this:
 
 # /categories endpoint - Get all categories
 @app.get("/categories")
-async def get_all_categories():
+def get_all_categories():
     categories = get_categories()
     return {"categories": categories}
 
 # Add a custom category
 @app.post("/categories/add")
-async def add_category(name: str):
+def add_category(name: str):
     if name in NON_SPENDING_CATEGORIES:
         return {"error": f"'{name}' is a reserved category"}
     with Session(engine) as session:
@@ -152,7 +188,7 @@ async def add_category(name: str):
 
 # Delete a category
 @app.delete("/categories/delete")
-async def delete_category(name: str):
+def delete_category(name: str):
     with Session(engine) as session:
         category = session.query(Category).filter_by(name=name).first()
         if not category:
@@ -168,7 +204,7 @@ def load_user_rules(session: Session) -> list[tuple[str, str]]:
 
 # /classify endpoint
 @app.post("/classify")
-async def classify(reclassify: bool = False):
+def classify(reclassify: bool = False):
     """Categorize stored transactions: user rules, then built-in rules, then the LLM.
 
     By default only transactions without a category are processed, so classifying again
@@ -181,7 +217,8 @@ async def classify(reclassify: bool = False):
         if session.query(Transaction).count() == 0:
             return {"error": "No data uploaded yet"}
 
-        query = session.query(Transaction)
+        # Only the columns we need, not full ORM objects
+        query = session.query(Transaction.id, Transaction.description, Transaction.amount, Transaction.category)
         if reclassify:
             query = query.filter(or_(Transaction.category_source.is_(None),
                                      Transaction.category_source != "manual"))
@@ -190,24 +227,26 @@ async def classify(reclassify: bool = False):
         pending = query.all()
 
         if pending:
-            result = predict_categories(client, [(t.description, t.amount, t.category) for t in pending],
+            result = predict_categories(client, [(p.description, p.amount, p.category) for p in pending],
                                         categories, user_rules=load_user_rules(session))
-            for t, category, source in zip(pending, result["categories"], result["sources"]):
-                t.predicted_category = category
-                t.category_source = source
+            # Bulk UPDATE by primary key (one executemany instead of an UPDATE per ORM object)
+            session.execute(update(Transaction), [
+                {"id": p.id, "predicted_category": category, "category_source": source}
+                for p, category, source in zip(pending, result["categories"], result["sources"])
+            ])
             print(f"Classified {len(pending)} transactions "
                   f"({result['sources'].count('user_rule')} by your rules, {sum(result['by_rule'])} by built-in rules), "
                   f"{result['llm_merchants']} unique merchants in {result['llm_calls']} LLM calls")
 
         session.commit()
 
-        return [t.to_dict() for t in session.query(Transaction).order_by(Transaction.date).all()]
+        return all_transactions(session)
 
 
 @app.get("/transactions")
-async def list_transactions():
+def list_transactions():
     with Session(engine) as session:
-        return [t.to_dict() for t in session.query(Transaction).order_by(Transaction.date).all()]
+        return all_transactions(session)
 
 
 def apply_user_rules(session: Session) -> int:
@@ -225,7 +264,7 @@ def apply_user_rules(session: Session) -> int:
 
 
 @app.post("/transactions/{transaction_id}/category")
-async def correct_category(transaction_id: str, category: str, apply_to_merchant: bool = True,
+def correct_category(transaction_id: str, category: str, apply_to_merchant: bool = True,
                            pattern: Optional[str] = None):
     """Fix a transaction's category.
 
@@ -272,13 +311,13 @@ async def correct_category(transaction_id: str, category: str, apply_to_merchant
 
 
 @app.get("/rules")
-async def list_rules():
+def list_rules():
     with Session(engine) as session:
         return {"rules": [r.to_dict() for r in session.query(MerchantRule).order_by(MerchantRule.pattern)]}
 
 
 @app.delete("/rules/{rule_id}")
-async def delete_rule(rule_id: int):
+def delete_rule(rule_id: int):
     """Delete a rule. Transactions it labeled are cleared and get re-categorized on the next /classify
     (by another matching rule, if any, otherwise by the built-in rules / LLM)."""
     with Session(engine) as session:
@@ -301,13 +340,15 @@ async def delete_rule(rule_id: int):
 
 # Endpoint to find deals based on spending
 @app.post("/deals")
-async def find_deals():
+def find_deals():
     with Session(engine) as session:
         if session.query(Transaction).count() == 0:
             return {"error": "No data uploaded yet"}
 
-        # Get top merchants by spending (purchases only, refunds/payments are negative)
-        rows = session.query(Transaction.description, Transaction.amount).filter(Transaction.amount > 0).all()
+        # Top merchants by spending (purchases only, refunds/payments are negative).
+        # Sum per description in SQL, then merge descriptions that clean to the same merchant.
+        rows = (session.query(Transaction.description, func.sum(Transaction.amount))
+                .filter(Transaction.amount > 0).group_by(Transaction.description).all())
 
     spend = pd.DataFrame(rows, columns=["description", "amount"])
     spend["merchant"] = spend["description"].map(clean_description)
@@ -338,7 +379,7 @@ async def find_deals():
 
 # Endpoint for chatting about expenses
 @app.post("/chat")
-async def chat(question: str):
+def chat(question: str):
     with Session(engine) as session:
         if session.query(Transaction).count() == 0:
             return {"error": "No data uploaded yet"}
@@ -355,7 +396,7 @@ async def chat(question: str):
             .group_by(category_expr)
             .all()
         )
-    summary = {category: round(total, 2) for category, total in rows}
+    summary = {category: round(float(total), 2) for category, total in rows}
 
     # Ask ChatGPT about the spending
     response = client.chat.completions.create(
@@ -374,58 +415,57 @@ async def chat(question: str):
 
     return {"answer": response.choices[0].message.content}
 
-@app.post("/fraud")
-async def detect_fraud():
-    with Session(engine) as session:
-        df_fraud = load_transactions_df(session)
+def fraud_flags(df: pd.DataFrame) -> pd.DataFrame:
+    """Rule-based fraud flags, vectorized per merchant (O(n log n) instead of a scan per row).
 
-    if df_fraud.empty:
+    Adds a "reasons" column (list of strings) to a copy of df[date, description, amount].
+    """
+    df = df[["date", "description", "amount"]].copy()
+    df["date"] = pd.to_datetime(df["date"])
+    by_merchant = df.groupby("description")["amount"]
+
+    # Rule 1: duplicate — same merchant more than twice on the same day
+    same_day = df.groupby(["date", "description"])["amount"].transform("size")
+    # Rule 2: unusual amount — over 3x the merchant's average (and over $50)
+    merchant_avg = by_merchant.transform("mean")
+    # Rule 3: high frequency — more than 5 charges at the same merchant within the last 7 days
+    # (counting [date - 7 days, date], same-day charges included), via binary search on sorted dates
+    in_window = pd.Series(0, index=df.index)
+    for _, idx in df.groupby("description").groups.items():
+        dates = df.loc[idx, "date"].sort_values()
+        values = dates.values
+        right = np.searchsorted(values, values, side="right")
+        left = np.searchsorted(values, (dates - pd.Timedelta(days=7)).values, side="left")
+        in_window.loc[dates.index] = right - left
+
+    reasons = [[] for _ in range(len(df))]
+    for pos in np.flatnonzero((same_day > 2).to_numpy()):
+        reasons[pos].append("Duplicate transaction: same merchant same day")
+    unusual = (df["amount"] > merchant_avg * 3) & (df["amount"] > 50)
+    for pos in np.flatnonzero(unusual.to_numpy()):
+        reasons[pos].append(f"Unusual amount: ${df['amount'].iat[pos]:.2f} vs avg ${merchant_avg.iat[pos]:.2f}")
+    for pos in np.flatnonzero((in_window > 5).to_numpy()):
+        reasons[pos].append(f"High frequency: {in_window.iat[pos]} transactions in 7 days")
+    df["reasons"] = reasons
+    return df
+
+
+@app.post("/fraud")
+def detect_fraud():
+    with Session(engine) as session:
+        df = load_transactions_df(session)
+
+    if df.empty:
         return {"error": "No data uploaded yet"}
 
-    df_fraud["date"] = pd.to_datetime(df_fraud["date"])
-
-    flags = []
-
-    for index, row in df_fraud.iterrows():
-        reasons = []
-
-        # Rule 1: 重复交易 — 同一天同一商家超过2次
-        same_day_same_merchant = df_fraud[
-            (df_fraud["date"] == row["date"]) &
-            (df_fraud["description"] == row["description"])
-        ]
-        if len(same_day_same_merchant) > 2:
-            reasons.append("Duplicate transaction: same merchant same day")
-
-        # Rule 2: 金额异常 — 超过该商家平均金额3倍
-        merchant_avg = df_fraud[
-            df_fraud["description"] == row["description"]
-        ]["amount"].mean()
-        if row["amount"] > merchant_avg * 3 and row["amount"] > 50:
-            reasons.append(f"Unusual amount: ${row['amount']:.2f} vs avg ${merchant_avg:.2f}")
-
-        # Rule 3: 高频消费 — 7天内同一商家超过5次
-        week_ago = row["date"] - pd.Timedelta(days=7)
-        recent_same_merchant = df_fraud[
-            (df_fraud["description"] == row["description"]) &
-            (df_fraud["date"] >= week_ago) &
-            (df_fraud["date"] <= row["date"])
-        ]
-        if len(recent_same_merchant) > 5:
-            reasons.append(f"High frequency: {len(recent_same_merchant)} transactions in 7 days")
-
-        flags.append({
-            "date": str(row["date"].date()),
-            "merchant": row["description"],
-            "amount": row["amount"],
-            "flagged": len(reasons) > 0,
-            "reasons": reasons
-        })
-
-    flagged = [f for f in flags if f["flagged"]]
-
+    flagged = fraud_flags(df)
+    flagged = flagged[flagged["reasons"].map(len) > 0]
     return {
-        "total_transactions": len(flags),
+        "total_transactions": len(df),
         "flagged_count": len(flagged),
-        "flagged_transactions": flagged
+        "flagged_transactions": [
+            {"date": str(row.date.date()), "merchant": row.description, "amount": row.amount,
+             "flagged": True, "reasons": row.reasons}
+            for row in flagged.itertuples()
+        ],
     }
