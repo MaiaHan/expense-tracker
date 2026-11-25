@@ -2,7 +2,7 @@
 
 Upload a credit card statement CSV and get every transaction categorized: rules first, then an LLM, and it learns from your corrections. Spending summaries leave out card payments and cashback, and refunds net out against the category they came from. Correctness is measured on 318 hand-labeled real transactions.
 
-**Stack:** FastAPI · SQLAlchemy (SQLite) · OpenAI `gpt-4o-mini` · Streamlit · pytest
+**Stack:** FastAPI · SQLAlchemy · PostgreSQL (SQLite for quick local runs) · Docker Compose · OpenAI `gpt-4o-mini` · Streamlit · pytest
 
 ## How categorization works
 
@@ -46,25 +46,40 @@ The labels CSV needs `description, amount, true_category`. Optional columns are 
 
 ## Running it
 
+Create a `.env` with your keys (it is read at runtime and never copied into the image):
+
+```
+OPENAI_API_KEY=...
+TAVILY_API_KEY=...     # only for the deals page
+```
+
+**With Docker** (PostgreSQL + API + UI):
+
+```bash
+docker compose up --build
+# UI: http://localhost:8501   API docs: http://localhost:8000/docs
+```
+
+**Without Docker** (SQLite file, `expense_tracker.db`):
+
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-
-# .env
-OPENAI_API_KEY=...
-TAVILY_API_KEY=...     # only for the deals page
-
 uvicorn main:app --reload      # API on :8000
-streamlit run app.py           # UI
+streamlit run app.py           # UI on :8501
 ```
 
-The SQLite database (`expense_tracker.db`) is created on first start. Set `DATABASE_URL` to use another database.
+`DATABASE_URL` selects the database (e.g. `postgresql://user:pass@host/db`). Tables are created on startup, and columns added in later versions are added to existing databases automatically.
 
 ## Tests
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest tests
+python -m pytest tests                                   # SQLite
+
+docker compose up -d db                                  # or against Postgres
+docker compose exec db psql -U expense -d expense_tracker -c "CREATE DATABASE expense_test"
+TEST_DATABASE_URL=postgresql://expense:expense@localhost:5432/expense_test python -m pytest tests
 ```
 
 The 24 tests cover:
@@ -75,7 +90,7 @@ The 24 tests cover:
 - the startup schema upgrade for older databases
 - `evaluate.py`
 
-The LLM is faked and each run uses a throwaway database, so the tests make no network calls.
+The LLM is faked, so the tests make no network calls. They pass on both SQLite and PostgreSQL.
 
 ## API
 

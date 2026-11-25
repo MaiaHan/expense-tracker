@@ -1,0 +1,13 @@
+# Secrets and personal data never go into the image; keys come in at runtime via env_file
+.env
+.env.*
+data/
+*.db
+*.sqlite*
+.venv/
+venv/
+__pycache__/
+*.pyc
+.git/
+.DS_Store
+tests/.test.db

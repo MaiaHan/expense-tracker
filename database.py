@@ -5,9 +5,12 @@ from sqlalchemy import create_engine, inspect, text, Column, Integer, String, Fl
 from sqlalchemy.orm import DeclarativeBase, Session
 from datetime import datetime
 
-# SQLite by default; override with DATABASE_URL (e.g. for tests or Postgres later)
+# SQLite by default for local use; docker-compose sets DATABASE_URL to Postgres
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///expense_tracker.db")
-engine = create_engine(DATABASE_URL)
+# Use the psycopg 3 driver for plain postgres:// / postgresql:// URLs
+if DATABASE_URL.startswith(("postgres://", "postgresql://")):
+    DATABASE_URL = "postgresql+psycopg://" + DATABASE_URL.split("://", 1)[1]
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 class Base(DeclarativeBase):
     pass

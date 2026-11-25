@@ -6,14 +6,16 @@ import types
 
 import pytest
 
-# Must be set before importing the app: the DB engine and API clients are created at import time
-os.environ["DATABASE_URL"] = "sqlite:///" + os.path.join(os.path.dirname(__file__), ".test.db")
+# Must be set before importing the app: the DB engine and API clients are created at import time.
+# SQLite by default; set TEST_DATABASE_URL to run the suite against Postgres (its tables get wiped).
+os.environ["DATABASE_URL"] = os.getenv("TEST_DATABASE_URL") or (
+    "sqlite:///" + os.path.join(os.path.dirname(__file__), ".test.db"))
 os.environ["OPENAI_API_KEY"] = "test-not-a-real-key"
 os.environ["TAVILY_API_KEY"] = "test-not-a-real-key"
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-if os.path.exists(os.environ["DATABASE_URL"][len("sqlite:///"):]):
-    os.remove(os.environ["DATABASE_URL"][len("sqlite:///"):])
+if os.environ["DATABASE_URL"].startswith("sqlite:///") and os.path.exists(os.environ["DATABASE_URL"][10:]):
+    os.remove(os.environ["DATABASE_URL"][10:])
 
 import database  # noqa: E402
 import main  # noqa: E402

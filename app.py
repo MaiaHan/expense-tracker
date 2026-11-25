@@ -2,9 +2,10 @@ import streamlit as st
 import requests
 import pandas as pd
 import json
+import os
 
-# API base URL
-API_URL = "http://127.0.0.1:8000"
+# API base URL (docker-compose points this at the api service)
+API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
 
 # Card payments and cashback aren't spending (refunds are: they net out their category)
 NON_SPENDING = ["Card Payment", "Rewards & Cashback"]
