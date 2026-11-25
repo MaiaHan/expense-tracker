@@ -20,6 +20,38 @@ CSV upload ──► column detection (LLM) ──► normalize + dedupe ──�
 - **Learning from corrections.** Fixing a transaction saves a rule: merchant name contains a pattern → category. The rule relabels past transactions and applies to future uploads without an LLM call. When several rules match, the most specific (longest) one wins. One-off fixes are never overwritten by reclassification.
 - **The LLM answers by id.** It doesn't echo merchant names back, so a slightly rewritten name can't silently turn into "Other". This also made responses about 3× faster, since the output is much shorter.
 
+## Deals
+
+`deals.py` finds promo codes for the chains you actually go to:
+
+1. **Pick merchants by visits, not spend.**
+   - It counts visits over the last 90 days of your data, so frequent lunch spots win over one large grocery run.
+   - Bills and subscriptions are skipped.
+2. **Identify each merchant once** with the LLM and cache the result. For example, `ARCO#01234 SEATTLE WA` becomes ARCO, a gas station, and a chain. Single local businesses are skipped, and several stores of one chain count together.
+3. **Search** with Tavily for `ARCO gas station promo code`. Adding the kind of business keeps same-name companies out. US results are boosted, and full page text is fetched.
+4. **Extract** structured deals with the LLM: code, discount, minimum spend, expiry, conditions, and a verbatim quote as evidence.
+5. **Verify each deal deterministically.** A deal is kept only if all of these hold:
+   - the quote is on the page
+   - the code is inside the quote
+   - there is a code or a concrete discount, and the discount and minimum spend in the description appear in the quote
+   - the brand appears in the page title, URL or quote
+   - the deal and the page are priced in US dollars
+   - it hasn't expired
+
+   Rejections are counted by reason. A re-search replaces a brand's old deals.
+
+Verification proves the page says it, not that the code still works: coupon sites list plenty of dead codes. The UI shows the quote and source link next to each code.
+
+**Iterating on real results.** I ran it on my own statement and checked every kept deal by hand. Each check above was added in response to a failure in one of these runs, and each has a regression test built from that failure.
+
+| Run | Deals kept | Wrong business or garbled | Description not faithful to source | Vague or single-product |
+|---|---|---|---|---|
+| 1: text-presence checks only | 13 | 5: a UK company named Arco for the ARCO gas station; Taco John's "TJ" app code for Trader Joe's; code fragment "WENTY" | 1: "$30 off" described as 30% | 3 |
+| 2: + business kind, brand, currency, code-in-quote checks | 8 | 0 | 1 | 6 |
+| 3: + min-spend and concrete-discount checks, skip single-product deals | 4 | 0 | 0 | 1 |
+
+In run 3 the cents check had first rejected a real offer ("bonus 10¢/gal in Rewards", ARCO). The fix was verified by replaying the saved pages (`DEALS_DEBUG_DIR`) without searching again. The sample is small, and fewer deals also means some real ones are missed.
+
 ## Evaluation
 
 `evaluate.py` runs the same pipeline as the app against a labeled CSV. The dataset is 12 months of my own credit card transactions (318 rows, 116 unique merchants), hand-checked. It isn't in the repo for privacy.
@@ -113,12 +145,14 @@ docker compose exec db psql -U expense -d expense_tracker -c "CREATE DATABASE ex
 TEST_DATABASE_URL=postgresql://expense:expense@localhost:5432/expense_test python -m pytest tests
 ```
 
-The 27 tests cover:
+The 51 tests cover:
 - the built-in rules and the categorization pipeline
 - upload dedupe, including uploads spanning many insert batches
 - spending summaries
 - correction rules (specificity, deletion fallback, manual fixes surviving reclassify)
 - the vectorized fraud rules matching the original implementation
+- deal verification, using cases taken from real runs (wrong business, foreign currency, code outside the quote, mismatched discount, cents, vague deals)
+- deal ranking by visits, caching, brand-spelling changes, and one failing search not affecting the rest
 - the startup schema upgrade for older databases
 - `evaluate.py`
 
@@ -135,12 +169,13 @@ The LLM is faked, so the tests make no network calls. They pass on both SQLite a
 | `GET /rules`, `DELETE /rules/{id}` | List or delete merchant rules. Deleting one falls back to broader rules, then the LLM. |
 | `GET/POST/DELETE /categories…` | Manage custom categories. Reserved names are rejected. |
 | `POST /chat` | Ask questions about your spending, using a category summary that excludes non-spending categories. |
-| `POST /deals` | Web search (Tavily) for coupons at your top 5 merchants. |
+| `POST /deals/refresh?limit=&force=` | Find deals at the chains you visit most (see below). Brands searched in the last 24h are skipped unless `force=true`. |
+| `GET /deals` | Unexpired deals grouped by brand. |
 | `POST /fraud` | Rule-based flags: more than 2 charges at the same merchant in one day, an amount over 3× the merchant's average, or more than 5 charges at the same merchant within 7 days. |
 
 ## Next
 
 - Use the issuer category only as a fallback when the model answers "Other", or turn it into candidate categories instead of a single label.
 - Run the eval on statements from other banks.
-- Coupon search: extract structured deals (merchant, code, discount, expiry) instead of raw search results.
+- Measure deal precision on a hand-checked sample, and add sources beyond web search (e.g. promo emails).
 - Stream large uploads instead of reading the whole CSV into memory; paginate `GET /transactions`.

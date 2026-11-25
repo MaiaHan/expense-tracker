@@ -1,7 +1,8 @@
 import os
 import re
 import hashlib
-from sqlalchemy import create_engine, inspect, text, Column, Date, DateTime, Index, Integer, Numeric, String
+from sqlalchemy import (create_engine, inspect, text, Boolean, Column, Date, DateTime, Float, Index, Integer,
+                        Numeric, String, Text, UniqueConstraint)
 from sqlalchemy.orm import DeclarativeBase, Session
 from datetime import datetime
 
@@ -64,6 +65,56 @@ class MerchantRule(Base):
 
     def to_dict(self):
         return {"id": self.id, "pattern": self.pattern, "category": self.category}
+
+# What a card-statement merchant is, as identified by the LLM once per merchant
+# (e.g. "MCDONALD'S F12345 SEATTLE WA" -> brand "McDonald's", a chain)
+class MerchantProfile(Base):
+    __tablename__ = "merchant_profiles"
+    merchant = Column(String, primary_key=True)   # classifier.merchant_key of the description
+    brand = Column(String)                        # None if the LLM couldn't tell
+    kind = Column(String)                         # e.g. "gas station": keeps same-name businesses apart
+    is_chain = Column(Boolean, nullable=False, default=False)
+    identified_at = Column(DateTime, default=datetime.now)
+
+
+# A deal found on the web, kept only after its code and quote were found verbatim in the source page
+class Deal(Base):
+    __tablename__ = "deals"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    brand = Column(String, nullable=False)
+    dedupe_key = Column(String, nullable=False)   # code if any, else normalized description
+    code = Column(String)
+    description = Column(Text, nullable=False)
+    discount_type = Column(String)                # percent | amount | bogo | free_item | other
+    discount_value = Column(Float)
+    min_spend = Column(Float)
+    expires_on = Column(Date)
+    conditions = Column(Text)
+    quote = Column(Text, nullable=False)          # verbatim evidence from the page
+    source_url = Column(String, nullable=False)
+    source_title = Column(String)
+    found_at = Column(DateTime, default=datetime.now)
+    last_seen_at = Column(DateTime, default=datetime.now)
+
+    __table_args__ = (UniqueConstraint("brand", "dedupe_key", name="uq_deals_brand_key"),)
+
+    def to_dict(self):
+        return {
+            "id": self.id, "brand": self.brand, "code": self.code, "description": self.description,
+            "discount_type": self.discount_type, "discount_value": self.discount_value,
+            "min_spend": self.min_spend, "expires_on": self.expires_on.isoformat() if self.expires_on else None,
+            "conditions": self.conditions, "quote": self.quote,
+            "source_url": self.source_url, "source_title": self.source_title,
+            "last_seen_at": self.last_seen_at.isoformat() if self.last_seen_at else None,
+        }
+
+
+# When each brand was last searched, so refreshing within the cache window costs nothing
+class DealSearch(Base):
+    __tablename__ = "deal_searches"
+    brand = Column(String, primary_key=True)
+    searched_at = Column(DateTime, nullable=False)
+
 
 # Default categories
 DEFAULT_CATEGORIES = [
@@ -135,6 +186,9 @@ def upgrade_schema():
                                   "USING round(amount::numeric, 2)"))
             if not isinstance(columns["date"], Date):
                 conn.execute(text("ALTER TABLE transactions ALTER COLUMN date TYPE DATE USING date::date"))
+        profile_columns = {c["name"] for c in inspector.get_columns("merchant_profiles")}
+        if "kind" not in profile_columns:
+            conn.execute(text("ALTER TABLE merchant_profiles ADD COLUMN kind VARCHAR"))
         for index in Transaction.__table__.indexes:
             if index.name not in indexes:
                 index.create(conn)

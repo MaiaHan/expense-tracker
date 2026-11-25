@@ -129,27 +129,53 @@ elif page == "Transactions":
 
 # ─── Deals ───
 elif page == "Deals":
-    st.header("💸 Deal Recommendations")
-    st.caption("Based on your top merchants, here are current deals and coupons")
-    
-    if st.button("Find Deals"):
-        with st.spinner("Searching for deals..."):
-            response = requests.post(f"{API_URL}/deals")
-            result = response.json()
-        
+    st.header("💸 Deals")
+    st.caption("Promo codes for the chains you visit most. Every code shown was found word-for-word "
+               "on its source page, but coupon sites list expired codes too, so check before relying on one.")
+
+    col1, col2 = st.columns([1, 1])
+    limit = col1.number_input("Chains to search", min_value=1, max_value=10, value=5)
+    force = col2.checkbox("Search again even if searched in the last 24 hours")
+    if st.button("Find deals"):
+        with st.spinner("Searching the web and checking each deal against its source..."):
+            result = requests.post(f"{API_URL}/deals/refresh", params={"limit": limit, "force": force}).json()
         if "error" in result:
             st.error(result["error"])
         else:
-            deals = result.get("deals", {})
-            if not deals:
-                st.warning("No deals found. Make sure you've uploaded and classified your data first.")
-            else:
-                for merchant, merchant_deals in deals.items():
-                    st.subheader(f"🏪 {merchant}")
-                    for deal in merchant_deals:
-                        with st.expander(deal.get("title", "Deal")):
-                            st.write(deal.get("snippet", ""))
-                            st.markdown(f"[View Deal]({deal.get('url', '')})")
+            for b in result["brands"]:
+                visits = f"{b['visits']} visit{'s' if b['visits'] != 1 else ''}"
+                if b["status"] == "searched":
+                    rejected = ", ".join(f"{n} {reason}" for reason, n in b["rejected"].items()) or "none"
+                    st.write(f"**{b['brand']}** ({visits}): {b['kept']} deals kept "
+                             f"from {b['candidates']} found on {b['pages']} pages · rejected: {rejected}")
+                elif b["status"] == "cached":
+                    st.write(f"**{b['brand']}** ({visits}): searched in the last 24 hours")
+                else:
+                    st.warning(f"{b['brand']}: {b.get('error')}")
+
+    def md(text):
+        """Escape $ so Streamlit doesn't render "$30 off ... $75+" as a LaTeX formula."""
+        return str(text).replace("$", "\\$")
+
+    deals = requests.get(f"{API_URL}/deals").json().get("deals", {})
+    if not deals:
+        st.info("No deals yet. Upload a statement, then click Find deals.")
+    for brand, brand_deals in deals.items():
+        st.subheader(brand)
+        for deal in brand_deals:
+            with st.container(border=True):
+                left, right = st.columns([3, 1])
+                left.markdown(f"**{md(deal['description'])}**")
+                if deal["code"]:
+                    right.code(deal["code"], language=None)
+                details = []
+                if deal["min_spend"]:
+                    details.append(f"min spend \\${deal['min_spend']:g}")
+                if deal["conditions"]:
+                    details.append(md(deal["conditions"]))
+                details.append(f"expires {deal['expires_on']}" if deal["expires_on"] else "no expiry listed")
+                left.caption(" · ".join(details))
+                st.caption(f"“{md(deal['quote'])}” — [{md(deal['source_title'] or 'source')}]({deal['source_url']})")
 
 # ─── Chat ───
 elif page == "Chat":
