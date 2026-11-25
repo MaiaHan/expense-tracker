@@ -1,6 +1,7 @@
 import os
 import io
 import json
+from typing import Optional
 import pandas as pd
 from openai import OpenAI
 from tavily import TavilyClient
@@ -9,10 +10,10 @@ from fastapi import FastAPI, UploadFile, File
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 from database import (
-    init_db, get_categories, engine, Transaction, Category, make_transaction_id,
+    init_db, get_categories, engine, Transaction, Category, MerchantRule, make_transaction_id,
     NON_SPENDING_CATEGORIES,
 )
-from classifier import clean_description, predict_categories
+from classifier import clean_description, merchant_key, match_user_rule, predict_categories
 
 # Load API keys from .env file
 load_dotenv()
@@ -161,14 +162,18 @@ async def delete_category(name: str):
     return {"success": True, "message": f"Category '{name}' deleted"}
 
 
+def load_user_rules(session: Session) -> list[tuple[str, str]]:
+    return [(r.pattern, r.category) for r in session.query(MerchantRule).all()]
+
+
 # /classify endpoint
 @app.post("/classify")
 async def classify(reclassify: bool = False):
-    """Categorize stored transactions with the LLM.
+    """Categorize stored transactions: user rules, then built-in rules, then the LLM.
 
-    By default only transactions without a predicted category are sent to the LLM,
-    so classifying again after a new upload doesn't pay for already-labeled rows.
-    Pass reclassify=true to redo everything (e.g. after changing categories).
+    By default only transactions without a category are processed, so classifying again
+    after a new upload doesn't pay for already-labeled rows.
+    Pass reclassify=true to redo everything except transactions the user fixed by hand.
     """
     categories = get_categories()
 
@@ -177,20 +182,122 @@ async def classify(reclassify: bool = False):
             return {"error": "No data uploaded yet"}
 
         query = session.query(Transaction)
-        if not reclassify:
+        if reclassify:
+            query = query.filter(or_(Transaction.category_source.is_(None),
+                                     Transaction.category_source != "manual"))
+        else:
             query = query.filter(Transaction.predicted_category.is_(None))
         pending = query.all()
 
         if pending:
-            result = predict_categories(client, [(t.description, t.amount, t.category) for t in pending], categories)
-            for t, category in zip(pending, result["categories"]):
+            result = predict_categories(client, [(t.description, t.amount, t.category) for t in pending],
+                                        categories, user_rules=load_user_rules(session))
+            for t, category, source in zip(pending, result["categories"], result["sources"]):
                 t.predicted_category = category
-            print(f"Classified {len(pending)} transactions ({sum(result['by_rule'])} by rule), "
+                t.category_source = source
+            print(f"Classified {len(pending)} transactions "
+                  f"({result['sources'].count('user_rule')} by your rules, {sum(result['by_rule'])} by built-in rules), "
                   f"{result['llm_merchants']} unique merchants in {result['llm_calls']} LLM calls")
 
         session.commit()
 
         return [t.to_dict() for t in session.query(Transaction).order_by(Transaction.date).all()]
+
+
+@app.get("/transactions")
+async def list_transactions():
+    with Session(engine) as session:
+        return [t.to_dict() for t in session.query(Transaction).order_by(Transaction.date).all()]
+
+
+def apply_user_rules(session: Session) -> int:
+    """Re-apply all user rules to stored transactions (hand-fixed ones are left alone)."""
+    rules = load_user_rules(session)
+    updated = 0
+    for t in session.query(Transaction).filter(or_(Transaction.category_source.is_(None),
+                                                   Transaction.category_source != "manual")):
+        category = match_user_rule(t.description, rules)
+        if category and (category != t.predicted_category or t.category_source != "user_rule"):
+            t.predicted_category = category
+            t.category_source = "user_rule"
+            updated += 1
+    return updated
+
+
+@app.post("/transactions/{transaction_id}/category")
+async def correct_category(transaction_id: str, category: str, apply_to_merchant: bool = True,
+                           pattern: Optional[str] = None):
+    """Fix a transaction's category.
+
+    apply_to_merchant=true (default) saves a rule so every transaction whose merchant name
+    contains `pattern` gets this category, now and in future uploads. `pattern` defaults to
+    this transaction's merchant name; shorten it (e.g. "LYFT") to cover name variations.
+    apply_to_merchant=false changes only this one transaction.
+    """
+    if category not in set(get_categories()) | set(NON_SPENDING_CATEGORIES):
+        return {"error": f"Unknown category '{category}'"}
+
+    with Session(engine) as session:
+        t = session.get(Transaction, transaction_id)
+        if not t:
+            return {"error": f"Transaction '{transaction_id}' not found"}
+
+        if not apply_to_merchant:
+            t.predicted_category = category
+            t.category_source = "manual"
+            session.commit()
+            return {"success": True, "updated": 1, "rule": None}
+
+        pattern = " ".join((pattern or merchant_key(t.description)).upper().split())
+        if not pattern:
+            return {"error": "Pattern is empty"}
+        if pattern not in merchant_key(t.description):
+            return {"error": f"Pattern '{pattern}' doesn't match this transaction's merchant "
+                             f"'{merchant_key(t.description)}'"}
+
+        rule = session.query(MerchantRule).filter_by(pattern=pattern).first()
+        if rule:
+            rule.category = category
+        else:
+            rule = MerchantRule(pattern=pattern, category=category)
+            session.add(rule)
+        session.flush()
+
+        # This transaction follows the rule from now on, even if it was hand-fixed before
+        if t.category_source == "manual":
+            t.category_source = None
+        updated = apply_user_rules(session)
+        session.commit()
+        return {"success": True, "updated": updated, "rule": rule.to_dict()}
+
+
+@app.get("/rules")
+async def list_rules():
+    with Session(engine) as session:
+        return {"rules": [r.to_dict() for r in session.query(MerchantRule).order_by(MerchantRule.pattern)]}
+
+
+@app.delete("/rules/{rule_id}")
+async def delete_rule(rule_id: int):
+    """Delete a rule. Transactions it labeled are cleared and get re-categorized on the next /classify
+    (by another matching rule, if any, otherwise by the built-in rules / LLM)."""
+    with Session(engine) as session:
+        rule = session.get(MerchantRule, rule_id)
+        if not rule:
+            return {"error": f"Rule {rule_id} not found"}
+        pattern = rule.pattern
+        session.delete(rule)
+        session.flush()
+
+        cleared = 0
+        for t in session.query(Transaction).filter(Transaction.category_source == "user_rule"):
+            if pattern in merchant_key(t.description):
+                t.predicted_category = None
+                t.category_source = None
+                cleared += 1
+        reapplied = apply_user_rules(session)
+        session.commit()
+        return {"success": True, "cleared": cleared, "reassigned_by_other_rules": reapplied}
 
 # Endpoint to find deals based on spending
 @app.post("/deals")

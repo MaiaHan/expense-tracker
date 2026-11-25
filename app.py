@@ -6,6 +6,10 @@ import json
 # API base URL
 API_URL = "http://127.0.0.1:8000"
 
+# Card payments and cashback aren't spending (refunds are: they net out their category)
+NON_SPENDING = ["Card Payment", "Rewards & Cashback"]
+SOURCE_LABELS = {"manual": "you (this one)", "user_rule": "your rule", "rule": "built-in rule", "llm": "AI"}
+
 st.set_page_config(
     page_title="AI Expense Tracker",
     page_icon="💰",
@@ -16,7 +20,7 @@ st.title("💰 AI Expense Tracker")
 st.caption("Upload your bank CSV, get AI-powered insights and deal recommendations")
 
 # Sidebar for navigation
-page = st.sidebar.selectbox("Navigate", ["Upload & Classify", "Deals", "Chat", "Settings"])
+page = st.sidebar.selectbox("Navigate", ["Upload & Classify", "Transactions", "Deals", "Chat", "Settings"])
 
 # ─── Upload & Classify ───
 if page == "Upload & Classify":
@@ -57,8 +61,6 @@ if page == "Upload & Classify":
                     # Show summary chart
                     st.subheader("Spending by Category")
                     # Net out refunds — positive expenses minus negative refunds
-                    # Card payments and cashback aren't spending; refunds stay in and net out
-                    NON_SPENDING = ["Card Payment", "Rewards & Cashback"]
                     spending = df[~df["predicted_category"].isin(NON_SPENDING)]
                     category_summary = spending.groupby("predicted_category")["amount"].sum()
                     category_summary = category_summary.sort_values(ascending=False)
@@ -70,6 +72,59 @@ if page == "Upload & Classify":
                     # Show transactions table
                     st.subheader("Transactions")
                     st.dataframe(df)
+
+# ─── Transactions: review and fix categories ───
+elif page == "Transactions":
+    st.header("🧾 Transactions")
+    if "flash" in st.session_state:
+        st.success(st.session_state.pop("flash"))
+
+    transactions = requests.get(f"{API_URL}/transactions").json()
+    if not transactions:
+        st.info("No transactions yet. Upload a CSV first.")
+    else:
+        df = pd.DataFrame(transactions)
+        df["labeled by"] = df["category_source"].map(SOURCE_LABELS).fillna("")
+        only_other = st.checkbox("Only show transactions labeled Other")
+        view = df[df["predicted_category"] == "Other"] if only_other else df
+        st.dataframe(view[["date", "description", "amount", "predicted_category", "labeled by"]],
+                     width="stretch", hide_index=True)
+
+        st.subheader("Fix a category")
+        categories = requests.get(f"{API_URL}/categories").json().get("categories", []) + NON_SPENDING
+        rows_by_id = df.set_index("id")
+        labels = {
+            tid: f"{r['date']}  {r['description']}  ${r['amount']:.2f}  ({r['predicted_category'] or 'unclassified'})"
+            for tid, r in rows_by_id.loc[view["id"]].iterrows()
+        }
+        choice = st.selectbox("Transaction", list(labels), format_func=lambda tid: labels.get(tid, tid))
+        if choice is not None:
+            current = rows_by_id.at[choice, "predicted_category"]
+            new_category = st.selectbox("New category", categories,
+                                        index=categories.index(current) if current in categories else 0)
+            apply_to_merchant = st.checkbox("Remember this for the merchant (all past and future transactions)", value=True)
+            pattern = ""
+            if apply_to_merchant:
+                pattern = st.text_input(
+                    "Merchant name contains",
+                    key=f"pattern_{choice}",
+                    help="Leave empty to use the full merchant name. Shorten it to cover variations, "
+                         "e.g. LYFT matches every LYFT *RIDE <driver> variation.",
+                )
+            if st.button("Save"):
+                params = {"category": new_category, "apply_to_merchant": apply_to_merchant}
+                if pattern.strip():
+                    params["pattern"] = pattern
+                result = requests.post(f"{API_URL}/transactions/{choice}/category", params=params).json()
+                if "error" in result:
+                    st.error(result["error"])
+                else:
+                    rule = result["rule"]
+                    st.session_state.flash = (
+                        f"Rule saved: merchant contains '{rule['pattern']}' → {rule['category']} "
+                        f"({result['updated']} transactions updated)" if rule else "Updated this transaction"
+                    )
+                    st.rerun()
 
 # ─── Deals ───
 elif page == "Deals":
@@ -139,6 +194,18 @@ elif page == "Settings":
             requests.delete(f"{API_URL}/categories/delete", params={"name": cat})
             st.rerun()
     
+    # Merchant rules learned from corrections
+    st.subheader("Merchant Rules")
+    rules = requests.get(f"{API_URL}/rules").json().get("rules", [])
+    if not rules:
+        st.caption("No rules yet. Fix a category on the Transactions page to create one.")
+    for rule in rules:
+        col1, col2 = st.columns([4, 1])
+        col1.write(f"Merchant contains **{rule['pattern']}** → {rule['category']}")
+        if col2.button("Delete", key=f"rule_{rule['id']}"):
+            requests.delete(f"{API_URL}/rules/{rule['id']}")
+            st.rerun()
+
     # Add new category
     st.subheader("Add New Category")
     new_cat = st.text_input("Category name")

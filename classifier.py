@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import re
 import json
-from database import CARD_PAYMENT, rule_based_category
+from database import CARD_PAYMENT, NON_SPENDING_CATEGORIES, rule_based_category
 
 MODEL = "gpt-4o-mini"
 # Max number of merchant descriptions sent to the LLM in one request
@@ -19,6 +19,21 @@ def clean_description(text):
     text = re.sub(r'\d{10,}', '', text)
     text = re.sub(r'\d{3}-\d{3}-\d{4}', '', text)
     return text.strip()
+
+
+def merchant_key(description: str) -> str:
+    """Normalized merchant text that user rules are matched against."""
+    return " ".join(clean_description(description).upper().split())
+
+
+def match_user_rule(description: str, rules: list[tuple[str, str]]):
+    """Category of the most specific (longest) rule pattern contained in the merchant name."""
+    key = merchant_key(description)
+    best = None
+    for pattern, category in rules:
+        if pattern and pattern in key and (best is None or len(pattern) > len(best[0])):
+            best = (pattern, category)
+    return best[1] if best else None
 
 
 def categorize_descriptions(client, items: list[tuple[str, str | None]], categories: list[str],
@@ -76,19 +91,29 @@ Example: {{"0": "Food & Dining", "1": "Transportation"}}"""
 
 
 def predict_categories(client, transactions: list[tuple], categories: list[str],
-                       use_bank_hint: bool = False) -> dict:
+                       use_bank_hint: bool = False, user_rules: list[tuple[str, str]] | None = None) -> dict:
     """Categorize (description, amount[, bank_category]) tuples.
 
-    Returns {"categories": [...one per transaction...], "by_rule": [bool, ...],
+    Order: the user's merchant rules, then built-in card payment / cashback rules, then the LLM.
+    Returns {"categories": [...], "sources": ["user_rule" | "rule" | "llm", ...], "by_rule": [bool, ...],
              "llm_calls": int, "llm_merchants": int, "unanswered": int}.
     """
     llm_categories = categories + [CARD_PAYMENT]
+    allowed = set(categories) | set(NON_SPENDING_CATEGORIES)
+    # Ignore rules pointing at a category the user has since deleted
+    user_rules = [(p, cat) for p, cat in (user_rules or []) if cat in allowed]
 
-    # 1) Clear-cut card payments / cashback are labeled by rule, no LLM needed
-    predicted = [rule_based_category(t[0], t[1]) for t in transactions]
-    by_rule = [p is not None for p in predicted]
+    predicted, sources = [], []
+    for t in transactions:
+        category = match_user_rule(t[0], user_rules)
+        if category:
+            predicted.append(category); sources.append("user_rule")
+            continue
+        # Clear-cut card payments / cashback are labeled by rule, no LLM needed
+        category = rule_based_category(t[0], t[1])
+        predicted.append(category); sources.append("rule" if category else "llm")
 
-    # 2) Everything else goes to the LLM, once per unique (cleaned description, bank category)
+    # Everything else goes to the LLM, once per unique (cleaned description, bank category)
     def bank_category(t):
         value = t[2] if len(t) > 2 else None
         return value if isinstance(value, str) and value.strip() else None
@@ -111,4 +136,5 @@ def predict_categories(client, transactions: list[tuple], categories: list[str],
             category = "Other"
         predicted[i] = category
 
-    return {"categories": predicted, "by_rule": by_rule, "llm_merchants": len(to_ask), **stats}
+    return {"categories": predicted, "sources": sources, "by_rule": [s == "rule" for s in sources],
+            "llm_merchants": len(to_ask), **stats}

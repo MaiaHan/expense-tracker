@@ -1,7 +1,7 @@
 import os
 import re
 import hashlib
-from sqlalchemy import create_engine, Column, String, Float, DateTime
+from sqlalchemy import create_engine, inspect, text, Column, Integer, String, Float, DateTime
 from sqlalchemy.orm import DeclarativeBase, Session
 from datetime import datetime
 
@@ -21,7 +21,8 @@ class Transaction(Base):
     description = Column(String)
     amount = Column(Float)
     category = Column(String)                # category provided by the bank CSV, if any
-    predicted_category = Column(String)      # category assigned by the LLM
+    predicted_category = Column(String)      # category assigned by us (see category_source)
+    category_source = Column(String)         # "manual" | "user_rule" | "rule" | "llm"
     created_at = Column(DateTime, default=datetime.now)
 
     def to_dict(self):
@@ -32,6 +33,7 @@ class Transaction(Base):
             "amount": self.amount,
             "category": self.category,
             "predicted_category": self.predicted_category,
+            "category_source": self.category_source,
         }
 
 # Table for storing user's custom categories
@@ -39,6 +41,19 @@ class Category(Base):
     __tablename__ = "categories"
     name = Column(String, primary_key=True)
     created_at = Column(DateTime, default=datetime.now)
+
+# Categories the user taught us: any transaction whose merchant name contains `pattern`
+# gets `category`. Patterns are stored normalized (see classifier.merchant_key).
+class MerchantRule(Base):
+    __tablename__ = "merchant_rules"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    pattern = Column(String, unique=True, nullable=False)
+    category = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    def to_dict(self):
+        return {"id": self.id, "pattern": self.pattern, "category": self.category}
 
 # Default categories
 DEFAULT_CATEGORIES = [
@@ -93,6 +108,12 @@ def make_transaction_id(date: str, description: str, amount: float, occurrence: 
 def init_db():
     # Create all tables
     Base.metadata.create_all(engine)
+
+    # create_all doesn't add new columns to an existing table, so add them by hand
+    columns = {c["name"] for c in inspect(engine).get_columns("transactions")}
+    if "category_source" not in columns:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE transactions ADD COLUMN category_source VARCHAR"))
 
     # Add default categories if none exist
     with Session(engine) as session:
